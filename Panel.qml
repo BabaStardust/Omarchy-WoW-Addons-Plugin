@@ -153,6 +153,11 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { root.refresh(); root.checkUpdates(); return "ok" }
+    function tab(name: string): string {
+      if (["search", "installed", "settings"].indexOf(name) < 0) return "unknown tab"
+      root.tab = name
+      return "ok"
+    }
     function search(query: string): string { root.tab = "search"; searchField.text = query; root.search(query); return "ok" }
     function status(): string { return root.updateCount + " updates · " + root.installed.installed.length + " installed" }
   }
