@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.babastardust.wow-addons",
+  "name": "WoW Addons",
+  "version": "1.1.0",
+  "author": "BabaStardust",
+  "license": "MIT",
+  "description": "CurseForge addon manager for World of Warcraft (default: WoW Forever): search, install, update and remove addons from the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "WoW Addons",
+    "description": "Shows pending addon updates; click to search, install and update CurseForge addons.",
+    "category": "Games",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "updateCheckHours": 6
+    },
+    "schema": [
+      {
+        "key": "updateCheckHours",
+        "type": "integer",
+        "min": 0,
+        "max": 48,
+        "label": "Update check interval in hours (0 = only when opened)",
+        "defaultValue": 6
+      }
+    ]
+  }
+}

@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""CurseForge addon manager for World of Warcraft (default: WoW Forever).
+
+Every subcommand prints one JSON document on stdout. Failures print
+{"ok": false, "error": "..."} and exit non-zero. The API key is read from
+the config directory (or $CURSEFORGE_API_KEY) and never printed.
+
+Config, state and the API key live outside the plugin directory on purpose:
+the shell reloads a plugin on any write below ~/.config/omarchy/plugins/, and
+`omarchy plugin update` must not touch user data.
+"""
+
+import glob
+import hashlib
+import json
+import os
+import shutil
+import socket
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path
+
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "io.github.babastardust.wow-addons"
+CONFIG_FILE = Path(os.environ.get("WOWADDONS_CONFIG") or CONFIG_DIR / "config.json")
+KEY_FILE = Path(os.environ.get("WOWADDONS_KEY_FILE") or CONFIG_DIR / "curseforge-key")
+STATE_FILE = Path(os.environ.get("WOWADDONS_STATE") or Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "io.github.babastardust.wow-addons" / "installed.json")
+# Early versions kept the key inside the plugin directory.
+LEGACY_KEY_FILE = PLUGIN_DIR / "curseforge-key"
+
+API = "https://api.curseforge.com/v1"
+GAME_ID = 1
+WEBSITE = "https://www.curseforge.com/wow/addons/"
+
+# Empty wowRoot/flavor mean "auto-detect" (see resolve()).
+DEFAULT_CONFIG = {
+    "wowRoot": "",
+    "flavor": "",
+    "addonsDir": "",
+    "gameVersionTypeId": 88568,
+    # 1 = release only, 2 = release + beta, 3 = release + beta + alpha.
+    "releaseType": 3,
+}
+
+# Glob patterns: Battle.net under Wine/Proton, Lutris, Heroic, Steam prefixes.
+WOW_ROOT_CANDIDATES = [
+    "~/Games/battlenet/drive_c/Program Files*/World of Warcraft",
+    "~/Games/world-of-warcraft/drive_c/Program Files*/World of Warcraft",
+    "~/Games/*/drive_c/Program Files*/World of Warcraft",
+    "~/.wine/drive_c/Program Files*/World of Warcraft",
+    "~/.local/share/Steam/steamapps/compatdata/*/pfx/drive_c/Program Files*/World of Warcraft",
+    "~/.local/share/lutris/runners/wine/*/drive_c/Program Files*/World of Warcraft",
+]
+
+KEY_CONSOLE_URL = "https://console.curseforge.com/"
+KEY_HELP_URL = "https://docs.curseforge.com/rest-api/#getting-started"
+
+
+class Failure(Exception):
+    def __init__(self, message, **extra):
+        super().__init__(message)
+        self.extra = extra
+
+
+# Try IPv4 first: a broken IPv6 route otherwise stalls every request until
+# the v6 connect times out. IPv6 stays available as a fallback.
+_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_v4_first(*args, **kwargs):
+    return sorted(_getaddrinfo(*args, **kwargs), key=lambda r: r[0] != socket.AF_INET)
+
+
+socket.getaddrinfo = _getaddrinfo_v4_first
+
+
+def out(data, code=0):
+    json.dump(data, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    sys.exit(code)
+
+
+# ── config / state ─────────────────────────────────────────────────────
+
+
+def read_json(path, fallback):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return fallback
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(read_json(CONFIG_FILE, {}))
+    return cfg
+
+
+def detect_roots():
+    found = []
+    for pattern in WOW_ROOT_CANDIDATES:
+        expanded = os.path.expanduser(pattern)
+        for hit in sorted(glob.glob(expanded)):
+            if os.path.isdir(hit) and hit not in found:
+                found.append(hit)
+    return found
+
+
+def flavors_in(root):
+    """Flavor directories (_retail_, _classic_era_, ...) below a WoW root."""
+    try:
+        return sorted(p.name for p in Path(root).iterdir() if p.is_dir() and p.name.startswith("_") and p.name.endswith("_"))
+    except OSError:
+        return []
+
+
+def resolve(cfg):
+    """Work out the AddOns directory from config and auto-detection."""
+    env_dir = os.environ.get("WOWADDONS_ADDONS_DIR")
+    if env_dir:
+        return {"addonsDir": env_dir, "source": "env", "wowRoot": "", "flavor": ""}
+    if cfg.get("addonsDir"):
+        return {"addonsDir": cfg["addonsDir"], "source": "config", "wowRoot": cfg.get("wowRoot", ""), "flavor": cfg.get("flavor", "")}
+    root = cfg.get("wowRoot") or next(iter(detect_roots()), "")
+    if not root:
+        return {"addonsDir": "", "source": "none", "wowRoot": "", "flavor": ""}
+    flavor = cfg.get("flavor")
+    if not flavor:
+        found = flavors_in(root)
+        # Forever betas ship as _classic_beta_ or _forever_*; prefer those, then any classic flavor.
+        flavor = next((f for f in found if "forever" in f or "classic_beta" in f), "")
+    if not flavor:
+        return {"addonsDir": "", "source": "no-flavor", "wowRoot": root, "flavor": ""}
+    return {"addonsDir": str(Path(root) / flavor / "Interface" / "AddOns"), "source": "detected", "wowRoot": root, "flavor": flavor}
+
+
+def addons_dir(cfg):
+    info = resolve(cfg)
+    if not info["addonsDir"]:
+        raise Failure("No AddOns folder found. Set the WoW folder and flavor in Settings.", code="no_addons_dir")
+    path = Path(info["addonsDir"])
+    # The AddOns folder itself may be missing on a fresh client; its parent must exist.
+    if not path.is_dir():
+        if path.parent.is_dir():
+            path.mkdir()
+        else:
+            raise Failure("AddOns folder does not exist: " + str(path), code="no_addons_dir")
+    return path
+
+
+def load_state():
+    state = read_json(STATE_FILE, {})
+    state.setdefault("dirs", {})
+    return state
+
+
+def installed_for(state, path):
+    return state["dirs"].setdefault(str(path), {})
+
+
+# ── API ────────────────────────────────────────────────────────────────
+
+
+def read_key():
+    """The stored key, or "" — environment first, then the config dir, then the legacy location."""
+    env = os.environ.get("CURSEFORGE_API_KEY", "").strip()
+    if env:
+        return env
+    for path in (KEY_FILE, LEGACY_KEY_FILE):
+        try:
+            key = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if key:
+            return key
+    return ""
+
+
+def api_key():
+    key = read_key()
+    if not key:
+        raise Failure("No CurseForge API key set. Open Settings and paste your key (the ? button explains how to get one).", code="no_key")
+    return key
+
+
+def key_source():
+    if os.environ.get("CURSEFORGE_API_KEY", "").strip():
+        return "env"
+    for name, path in (("file", KEY_FILE), ("legacy", LEGACY_KEY_FILE)):
+        try:
+            if path.read_text(encoding="utf-8").strip():
+                return name
+        except OSError:
+            pass
+    return "none"
+
+
+def validate_key(key):
+    if len(key) < 20 or len(key) > 200 or any(c.isspace() or not c.isprintable() for c in key):
+        raise Failure("That does not look like a CurseForge API key. Keys are long and start with $2a$10$ — copy the whole line without spaces.", code="bad_key_format")
+
+
+def api(path, params=None, body=None):
+    url = API + path
+    if params:
+        url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
+    headers = {"Accept": "application/json", "x-api-key": api_key(), "User-Agent": "io.github.babastardust.wow-addons/1.0"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        raise Failure("CurseForge API: HTTP %d for %s" % (e.code, path), code="http_%d" % e.code)
+    except (urllib.error.URLError, socket.timeout) as e:
+        raise Failure("CurseForge unreachable: " + str(getattr(e, "reason", e)), code="network")
+
+
+def latest_file_index(mod, cfg):
+    """Newest file index entry for the configured game version type."""
+    vt = int(cfg["gameVersionTypeId"])
+    rt = int(cfg["releaseType"])
+    best = None
+    for idx in mod.get("latestFilesIndexes") or []:
+        if idx.get("gameVersionTypeId") != vt or idx.get("releaseType", 1) > rt:
+            continue
+        if best is None or idx["fileId"] > best["fileId"]:
+            best = idx
+    return best
+
+
+def mod_summary(mod, cfg, installed):
+    idx = latest_file_index(mod, cfg)
+    entry = installed.get(str(mod["id"]))
+    return {
+        "id": mod["id"],
+        "name": mod.get("name", ""),
+        "summary": mod.get("summary", ""),
+        "author": ", ".join(a.get("name", "") for a in mod.get("authors") or []),
+        "downloads": int(mod.get("downloadCount") or 0),
+        "url": (mod.get("links") or {}).get("websiteUrl") or WEBSITE + mod.get("slug", ""),
+        "distributable": mod.get("allowModDistribution") is not False,
+        "latestFileId": idx["fileId"] if idx else None,
+        "latestFileName": idx["filename"] if idx else "",
+        "gameVersion": idx.get("gameVersion", "") if idx else "",
+        "releaseType": idx.get("releaseType", 1) if idx else None,
+        "installed": entry is not None,
+        "installedFileId": entry["fileId"] if entry else None,
+    }
+
+
+def get_file(mod_id, file_id):
+    return api("/mods/%d/files/%d" % (mod_id, file_id))["data"]
+
+
+def get_mods(ids):
+    if not ids:
+        return []
+    return api("/mods", body={"modIds": [int(i) for i in ids], "filterPcOnly": True})["data"]
+
+
+# ── install ────────────────────────────────────────────────────────────
+
+
+def download(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": "io.github.babastardust.wow-addons/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
+            shutil.copyfileobj(resp, f)
+    except (urllib.error.URLError, socket.timeout) as e:
+        raise Failure("Download failed: " + str(getattr(e, "reason", e)), code="download")
+
+
+def sha1_of(path):
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_hash(path, file_info):
+    expected = next((h["value"] for h in file_info.get("hashes") or [] if h.get("algo") == 1), None)
+    if expected and sha1_of(path).lower() != expected.lower():
+        raise Failure("Checksum mismatch for " + file_info.get("fileName", "Download"), code="hash")
+
+
+def zip_members(zf):
+    """(info, relative parts) per file, refusing anything that escapes the zip.
+
+    Some addon zips are packed on Windows with backslash separators.
+    """
+    members = []
+    for info in zf.infolist():
+        name = info.filename.replace("\\", "/")
+        parts = [p for p in name.split("/") if p not in ("", ".")]
+        if name.startswith("/") or ".." in parts or (parts and ":" in parts[0]):
+            raise Failure("Unsafe path in ZIP: " + info.filename, code="bad_zip")
+        if len(parts) > 1 and not name.endswith("/"):
+            members.append((info, parts))
+    if not members:
+        raise Failure("ZIP contains no addon folders", code="bad_zip")
+    return members
+
+
+def install_zip(zip_path, target, previous_folders):
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except zipfile.BadZipFile:
+        raise Failure("Download is not a valid ZIP", code="bad_zip")
+    with zf:
+        members = zip_members(zf)
+        folders = sorted({parts[0] for _, parts in members})
+        staging = Path(tempfile.mkdtemp(prefix=".wowaddons-", dir=target))
+        try:
+            for info, parts in members:
+                dest = staging.joinpath(*parts)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as src, open(dest, "wb") as f:
+                    shutil.copyfileobj(src, f)
+            # Drop folders the previous version owned but the new one no longer ships.
+            for old in set(previous_folders) - set(folders):
+                if old and "/" not in old and (target / old).is_dir():
+                    shutil.rmtree(target / old)
+            for folder in folders:
+                dest = target / folder
+                if dest.is_dir():
+                    shutil.rmtree(dest)
+                elif dest.exists():
+                    dest.unlink()
+                os.replace(staging / folder, dest)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+    return folders
+
+
+def record(state, target, mod, file_info, folders):
+    installed_for(state, target)[str(mod["id"])] = {
+        "modId": mod["id"],
+        "name": mod.get("name", ""),
+        "fileId": file_info["id"],
+        "fileName": file_info.get("fileName", ""),
+        "versionString": file_info.get("displayName", ""),
+        "fileDate": file_info.get("fileDate", ""),
+        "folders": folders,
+        "url": (mod.get("links") or {}).get("websiteUrl") or WEBSITE + mod.get("slug", ""),
+        "installedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+
+def do_install(cfg, mod_id, file_id=None, zip_path=None):
+    target = addons_dir(cfg)
+    mods = get_mods([mod_id])
+    if not mods:
+        raise Failure("Addon %d not found" % mod_id, code="not_found")
+    mod = mods[0]
+    if file_id is None:
+        idx = latest_file_index(mod, cfg)
+        if not idx:
+            raise Failure("%s has no file for this game version" % mod["name"], code="no_file")
+        file_id = idx["fileId"]
+    file_info = get_file(mod_id, file_id)
+    state = load_state()
+    previous = installed_for(state, target).get(str(mod_id), {}).get("folders", [])
+
+    with tempfile.TemporaryDirectory(prefix="wowaddons-") as tmp:
+        if zip_path is None:
+            url = file_info.get("downloadUrl")
+            if not url:
+                # The author opted out of third-party downloads; respect that and
+                # let the user fetch the file from the website, then `import` it.
+                raise Failure(
+                    "%s does not allow downloads through third-party apps. Download it on CurseForge and import it." % mod["name"],
+                    code="distribution_disabled",
+                    url=mod_summary(mod, cfg, {})["url"] + "/files/%d" % file_id,
+                    fileName=file_info.get("fileName", ""),
+                )
+            zip_path = Path(tmp) / "addon.zip"
+            download(url, zip_path)
+        verify_hash(zip_path, file_info)
+        folders = install_zip(zip_path, target, previous)
+
+    record(state, target, mod, file_info, folders)
+    write_json(STATE_FILE, state)
+    return {"ok": True, "modId": mod_id, "name": mod["name"], "fileId": file_id, "version": file_info.get("displayName", ""), "folders": folders, "addonsDir": str(target)}
+
+
+def find_download(file_name):
+    """A manually downloaded zip with the expected name, newest first."""
+    dirs = [Path(os.environ.get("XDG_DOWNLOAD_DIR") or Path.home() / "Downloads"), Path.home() / "Downloads"]
+    hits = []
+    for d in dict.fromkeys(dirs):
+        p = d / file_name
+        if p.is_file():
+            hits.append(p)
+        # Browsers rename duplicates to "name (1).zip".
+        stem, suffix = os.path.splitext(file_name)
+        hits.extend(d.glob(glob_escape(stem) + " (*)" + glob_escape(suffix)) if d.is_dir() else [])
+    return max(hits, key=lambda p: p.stat().st_mtime) if hits else None
+
+
+def glob_escape(s):
+    return "".join("[" + c + "]" if c in "*?[" else c for c in s)
+
+
+# ── commands ───────────────────────────────────────────────────────────
+
+
+def installed_here(cfg):
+    target = resolve(cfg)["addonsDir"]
+    return load_state()["dirs"].get(target, {}) if target else {}
+
+
+def for_version(mods, cfg):
+    return [m for m in mods if latest_file_index(m, cfg)]
+
+
+SEARCH_CACHE = STATE_FILE.parent / "search-cache.json"
+SEARCH_TTL = 15 * 60
+
+
+def cmd_search(cfg, args):
+    """search [query|projectId] [--page=N]
+
+    GET /v1/mods/search is rate limited per key: after a pause one request
+    passes, requests right after it get 403 "API Key missing or invalid"
+    from CloudFront (measured 2026-09-26). So an empty query uses the
+    unthrottled featured lists, results are cached for a while, and on 403
+    the featured lists filtered by the query stand in, flagged "searchBlocked".
+    (The same path with a trailing slash is not throttled, but CloudFront
+    caches it keyed on gameId/index/pageSize only and returns other people's
+    results; it is deliberately not used.)
+    """
+    query = " ".join(a for a in args if not a.startswith("--")).strip()
+    page = 0
+    for a in args:
+        if a.startswith("--page="):
+            page = int(a.split("=", 1)[1])
+    installed = installed_here(cfg)
+
+    if query.isdigit():
+        mods = for_version(get_mods([int(query)]), cfg)
+        return {"ok": True, "query": query, "mode": "id", "total": len(mods), "page": 0, "results": [mod_summary(m, cfg, installed) for m in mods]}
+    if not query:
+        mods = featured_mods(cfg)
+        return {"ok": True, "query": "", "mode": "featured", "total": len(mods), "page": 0, "results": [mod_summary(m, cfg, installed) for m in mods]}
+
+    size = 30
+    params = {
+        "gameId": GAME_ID,
+        "gameVersionTypeId": cfg["gameVersionTypeId"],
+        "searchFilter": query,
+        "classId": 1,  # Addons
+        "sortField": 2,  # popularity
+        "sortOrder": "desc",
+        "pageSize": size,
+        "index": page * size,
+    }
+    cache_key = json.dumps(params, sort_keys=True)
+    cache = read_json(SEARCH_CACHE, {})
+    hit = cache.get(cache_key)
+    if hit and time.time() - hit["at"] < SEARCH_TTL:
+        res = hit["res"]
+    else:
+        try:
+            res = api("/mods/search", params)
+        except Failure as e:
+            if e.extra.get("code") != "http_403":
+                raise
+            needle = query.lower()
+            hits = [m for m in featured_mods(cfg) if needle in m.get("name", "").lower() or needle in m.get("summary", "").lower()]
+            return {"ok": True, "query": query, "mode": "featured", "searchBlocked": True, "total": len(hits), "page": 0, "results": [mod_summary(m, cfg, installed) for m in hits]}
+        now = time.time()
+        cache = {k: v for k, v in cache.items() if now - v["at"] < SEARCH_TTL}
+        cache[cache_key] = {"at": now, "res": res}
+        write_json(SEARCH_CACHE, cache)
+    return {"ok": True, "query": query, "mode": "search", "total": res["pagination"]["totalCount"], "page": page, "results": [mod_summary(m, cfg, installed) for m in res["data"]]}
+
+
+def featured_mods(cfg):
+    res = api("/mods/featured", body={"gameId": GAME_ID, "excludedModIds": [], "gameVersionTypeId": int(cfg["gameVersionTypeId"])})["data"]
+    seen, mods = set(), []
+    for group in ("featured", "popular", "recentlyUpdated"):
+        for m in res.get(group) or []:
+            if m["id"] not in seen:
+                seen.add(m["id"])
+                mods.append(m)
+    return for_version(mods, cfg)
+
+
+def cmd_browse(cfg, args):
+    installed = installed_here(cfg)
+    return {"ok": True, "mode": "featured", "results": [mod_summary(m, cfg, installed) for m in featured_mods(cfg)]}
+
+
+def cmd_files(cfg, args):
+    mod_id = int(args[0])
+    res = api("/mods/%d/files" % mod_id, {"gameVersionTypeId": cfg["gameVersionTypeId"], "pageSize": 20})
+    return {"ok": True, "modId": mod_id, "files": [
+        {"fileId": f["id"], "displayName": f.get("displayName", ""), "fileName": f.get("fileName", ""), "releaseType": f.get("releaseType"), "fileDate": f.get("fileDate", ""), "gameVersions": f.get("gameVersions", []), "downloadable": bool(f.get("downloadUrl"))}
+        for f in res["data"]
+    ]}
+
+
+def cmd_install(cfg, args):
+    return do_install(cfg, int(args[0]), int(args[1]) if len(args) > 1 else None)
+
+
+def cmd_import(cfg, args):
+    """import <modId> <fileId> [zip] — install a manually downloaded file."""
+    mod_id, file_id = int(args[0]), int(args[1])
+    if len(args) > 2:
+        zip_path = Path(args[2]).expanduser()
+    else:
+        info = get_file(mod_id, file_id)
+        zip_path = find_download(info.get("fileName", ""))
+        if not zip_path:
+            raise Failure("%s not found in ~/Downloads" % info.get("fileName", "Datei"), code="zip_missing", fileName=info.get("fileName", ""))
+    if not zip_path.is_file():
+        raise Failure("File not found: " + str(zip_path), code="zip_missing")
+    return do_install(cfg, mod_id, file_id, zip_path=zip_path)
+
+
+def cmd_list(cfg, args):
+    info = resolve(cfg)
+    installed = load_state()["dirs"].get(info["addonsDir"], {}) if info["addonsDir"] else {}
+    managed = set()
+    for entry in installed.values():
+        managed.update(entry.get("folders", []))
+    unmanaged = []
+    target = Path(info["addonsDir"]) if info["addonsDir"] else None
+    if target and target.is_dir():
+        unmanaged = sorted(p.name for p in target.iterdir() if p.is_dir() and not p.name.startswith(".") and p.name not in managed)
+    items = sorted(installed.values(), key=lambda e: e.get("name", "").lower())
+    return {"ok": True, "addonsDir": info["addonsDir"], "installed": items, "unmanaged": unmanaged}
+
+
+def check_updates(cfg):
+    target = addons_dir(cfg)
+    installed = load_state()["dirs"].get(str(target), {})
+    updates = []
+    for mod in get_mods(list(installed.keys())):
+        entry = installed.get(str(mod["id"]))
+        idx = latest_file_index(mod, cfg)
+        if entry and idx and idx["fileId"] > entry["fileId"]:
+            updates.append({
+                "modId": mod["id"],
+                "name": mod.get("name", ""),
+                "installedFileId": entry["fileId"],
+                "installedVersion": entry.get("versionString", ""),
+                "latestFileId": idx["fileId"],
+                "latestFileName": idx.get("filename", ""),
+                "distributable": mod.get("allowModDistribution") is not False,
+                "url": entry.get("url", ""),
+            })
+    return updates
+
+
+def cmd_updates(cfg, args):
+    return {"ok": True, "updates": check_updates(cfg)}
+
+
+def cmd_update(cfg, args):
+    return do_install(cfg, int(args[0]))
+
+
+def cmd_update_all(cfg, args):
+    done, skipped, failed = [], [], []
+    for u in check_updates(cfg):
+        if not u["distributable"]:
+            skipped.append({"modId": u["modId"], "name": u["name"], "url": u["url"]})
+            continue
+        try:
+            done.append(do_install(cfg, u["modId"], u["latestFileId"]))
+        except Failure as e:
+            failed.append({"modId": u["modId"], "name": u["name"], "error": str(e)})
+    return {"ok": not failed, "updated": done, "skipped": skipped, "failed": failed}
+
+
+def cmd_remove(cfg, args):
+    mod_id = str(int(args[0]))
+    target = addons_dir(cfg)
+    state = load_state()
+    entry = installed_for(state, target).pop(mod_id, None)
+    if entry is None:
+        raise Failure("Addon %s was not installed through this plugin" % mod_id, code="not_installed")
+    # Folders shared with another managed addon stay.
+    still_used = set()
+    for other in state["dirs"][str(target)].values():
+        still_used.update(other.get("folders", []))
+    for folder in entry.get("folders", []):
+        if folder and "/" not in folder and folder not in still_used and (target / folder).is_dir():
+            shutil.rmtree(target / folder)
+    write_json(STATE_FILE, state)
+    return {"ok": True, "modId": int(mod_id), "name": entry.get("name", "")}
+
+
+def cmd_config(cfg, args):
+    if args and args[0] == "set":
+        key, value = args[1], args[2] if len(args) > 2 else ""
+        if key not in DEFAULT_CONFIG:
+            raise Failure("Unknown key: " + key, code="bad_key")
+        if isinstance(DEFAULT_CONFIG[key], int):
+            value = int(value) if value else DEFAULT_CONFIG[key]
+        stored = read_json(CONFIG_FILE, {})
+        # An empty value drops the override, so the default applies again.
+        if value == "" or value == DEFAULT_CONFIG[key]:
+            stored.pop(key, None)
+        else:
+            stored[key] = value
+        write_json(CONFIG_FILE, stored)
+        cfg = load_config()
+    elif args and args[0] == "reset":
+        write_json(CONFIG_FILE, {})
+        cfg = load_config()
+    info = resolve(cfg)
+    return {
+        "ok": True,
+        "config": cfg,
+        "resolved": info,
+        "addonsDirExists": bool(info["addonsDir"]) and Path(info["addonsDir"]).parent.is_dir(),
+        "detectedRoots": detect_roots(),
+        "flavors": flavors_in(info["wowRoot"]) if info["wowRoot"] else [],
+        "hasKey": bool(read_key()),
+    }
+
+
+def key_status():
+    return {"ok": True, "hasKey": bool(read_key()), "source": key_source(), "keyFile": str(KEY_FILE), "consoleUrl": KEY_CONSOLE_URL, "helpUrl": KEY_HELP_URL}
+
+
+def write_key_file(text):
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = KEY_FILE.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, KEY_FILE)
+
+
+def cmd_key(cfg, args):
+    """key [status | set | check | clear]
+
+    `set` reads the key from stdin so it never shows up in the process list.
+    """
+    action = args[0] if args else "status"
+    if action == "status":
+        return key_status()
+    if action == "set":
+        key = sys.stdin.readline().strip()
+        validate_key(key)
+        try:
+            previous = KEY_FILE.read_text(encoding="utf-8")
+        except OSError:
+            previous = None
+        write_key_file(key + "\n")
+        # Verify right away so a typo is reported while the user is still looking at the field.
+        try:
+            return dict(cmd_key(cfg, ["check"]), saved=True)
+        except Failure as e:
+            if e.extra.get("code") != "key_rejected":
+                raise  # offline etc.: keep the key, it may well be fine
+            if previous is None:
+                KEY_FILE.unlink(missing_ok=True)
+            else:
+                write_key_file(previous)
+            raise
+    if action == "check":
+        try:
+            api("/games/%d" % GAME_ID)
+        except Failure as e:
+            if e.extra.get("code") in ("http_401", "http_403"):
+                raise Failure("CurseForge rejected this key (HTTP %s). Check that you copied the whole key, or create a new one." % e.extra["code"][5:], code="key_rejected")
+            raise
+        return dict(key_status(), valid=True)
+    if action == "clear":
+        for path in (KEY_FILE, LEGACY_KEY_FILE):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        return key_status()
+    raise Failure("Unknown key action: " + action, code="bad_args")
+
+
+def cmd_version_types(cfg, args):
+    return {"ok": True, "types": [{"id": t["id"], "name": t["name"]} for t in api("/games/%d/version-types" % GAME_ID)["data"]]}
+
+
+COMMANDS = {
+    "search": (cmd_search, 0),
+    "browse": (cmd_browse, 0),
+    "files": (cmd_files, 1),
+    "install": (cmd_install, 1),
+    "import": (cmd_import, 2),
+    "list": (cmd_list, 0),
+    "updates": (cmd_updates, 0),
+    "update": (cmd_update, 1),
+    "update-all": (cmd_update_all, 0),
+    "remove": (cmd_remove, 1),
+    "config": (cmd_config, 0),
+    "key": (cmd_key, 0),
+    "version-types": (cmd_version_types, 0),
+}
+
+USAGE = "usage: wowaddons {search [query|projectId] | browse | files <modId> | install <modId> [fileId] | import <modId> <fileId> [zip] | list | updates | update <modId> | update-all | remove <modId> | config [set <key> <value> | reset] | key [status|set|check|clear] | version-types}"
+
+
+def main(argv):
+    if not argv or argv[0] not in COMMANDS:
+        out({"ok": False, "error": USAGE}, 2)
+    fn, min_args = COMMANDS[argv[0]]
+    args = argv[1:]
+    if len(args) < min_args:
+        out({"ok": False, "error": USAGE}, 2)
+    try:
+        out(fn(load_config(), args))
+    except Failure as e:
+        out(dict({"ok": False, "error": str(e)}, **e.extra), 1)
+    except ValueError as e:
+        out({"ok": False, "error": "Invalid argument: " + str(e)}, 2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
