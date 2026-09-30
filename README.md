@@ -5,6 +5,8 @@ addons from [CurseForge](https://www.curseforge.com/wow): search, install,
 update and remove them without leaving your desktop. Defaults to
 **WoW: Forever**; Classic and Retail work too.
 
+![WoW Addons panel: Search, Installed and Settings tabs](preview.png)
+
 - Bar icon shows how many updates are pending (right-click re-checks)
 - Search by name or project ID, one-click install
 - Installed tab with version info, per-addon update/remove, "update all"
