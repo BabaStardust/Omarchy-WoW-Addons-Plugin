@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.babastardust.wow-addons",
   "name": "WoW Addons",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "BabaStardust",
   "license": "MIT",
   "description": "CurseForge addon manager for World of Warcraft (default: WoW Forever): search, install, update and remove addons from the bar.",

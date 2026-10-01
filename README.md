@@ -91,6 +91,17 @@ Everything the panel does is available as `bin/wowaddons <command>` (JSON
 output): `search`, `install`, `update-all`, `list`, `remove`, `config`,
 `key [status|set|check|clear]`.
 
+## Development checks
+
+```bash
+omarchy plugin validate .
+python3 -B -m unittest discover -s tests -v
+```
+
+The regression tests use dummy keys and isolated temporary directories;
+they make no network requests or changes to your game. See
+[CHANGELOG.md](CHANGELOG.md) for release changes.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Not affiliated with CurseForge, Overwolf or

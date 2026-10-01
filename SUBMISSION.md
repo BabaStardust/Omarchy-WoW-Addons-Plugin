@@ -1,5 +1,26 @@
 # Marketplace submission
 
+## Republish 1.1.1
+
+Existing submission: https://github.com/omacom/omarchy-plugin-marketplace/issues/9401
+
+The latest reviewer reassessment withdrew the previous key-file concern and
+reported no concrete security blocker in the reviewed scope. Version 1.1.1
+nevertheless hardens key storage with exclusive private temporary files,
+descriptor mode enforcement and atomic replacement; see CHANGELOG.md.
+
+Before approval, the marketplace's structural/Quattro and automated security
+reports must be rerun on the exact updated repository HEAD. Editing the
+existing submission issue requests a retry; posting a comment alone does not.
+The reviewer also reported a marketplace capacity blocker, which this plugin
+update cannot resolve. Do not describe this release as approved or listed until
+the marketplace confirms it.
+
+Local checks: `omarchy plugin validate .` and
+`python3 -B -m unittest discover -s tests -v`.
+
+## Submission answers
+
 Pre-filled answers for the submission issue at
 https://github.com/omacom/omarchy-plugin-marketplace/issues/new?template=submit-plugin.yml
 
