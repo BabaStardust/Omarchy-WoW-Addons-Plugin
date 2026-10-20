@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0
+
+- Add a labelled "Update all (N)" button to the Installed tab, shown while
+  updates are pending. The header icon, the new `u` shortcut and the new IPC
+  method `updateAll` share the same action.
+
 ## 1.1.1
 
 - Save API keys through an exclusively created, unpredictable temporary file

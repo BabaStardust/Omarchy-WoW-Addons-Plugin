@@ -105,6 +105,12 @@ Panel {
     run(["update", String(modId)], "Updating " + name)
   }
 
+  function updateAll() {
+    if (busy || updateCount === 0) return
+    pendingImport = null
+    run(["update-all"], "Updating all addons")
+  }
+
   function openUrl(url) {
     if (url) Quickshell.execDetached(["xdg-open", url])
   }
@@ -159,6 +165,7 @@ Panel {
       return "ok"
     }
     function search(query: string): string { root.tab = "search"; searchField.text = query; root.search(query); return "ok" }
+    function updateAll(): string { root.updateAll(); return "ok" }
     function status(): string { return root.updateCount + " updates · " + root.installed.installed.length + " installed" }
   }
 
@@ -311,6 +318,7 @@ Panel {
         else if (t === "i" || t === "I") root.tab = "installed"
         else if (t === "e" || t === "E") root.tab = "settings"
         else if (t === "r" || t === "R") { root.refresh(); root.checkUpdates() }
+        else if (t === "u" || t === "U") root.updateAll()
       }
 
       Flickable {
@@ -372,12 +380,12 @@ Panel {
               }
               PanelActionButton {
                 iconText: "󰚰"
-                tooltipText: "Install all updates"
+                tooltipText: "Install all updates (u)"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 enabled: !root.busy && root.updateCount > 0
                 opacity: enabled ? 1.0 : 0.4
-                onClicked: root.run(["update-all"], "Updating all addons")
+                onClicked: root.updateAll()
               }
               PanelActionButton {
                 iconText: "󰉋"
@@ -517,6 +525,34 @@ Panel {
             visible: root.tab === "installed" && root.hasKey
             width: parent.width
             spacing: Style.space(6)
+
+            RowLayout {
+              visible: root.updateCount > 0
+              width: parent.width
+              spacing: Style.space(6)
+
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                elide: Text.ElideRight
+                text: root.updateCount + (root.updateCount === 1 ? " update available" : " updates available")
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+              Button {
+                iconText: "󰚰"
+                text: "Update all (" + root.updateCount + ")"
+                tooltipText: "Install all updates (u)"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                enabled: !root.busy
+                opacity: enabled ? 1.0 : 0.4
+                onClicked: root.updateAll()
+              }
+            }
 
             Text {
               visible: root.installed.installed.length === 0
