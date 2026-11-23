@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.3.0
+
+- Installs and updates run as parallel background jobs (up to 4 downloads at
+  once) with a job list in the panel; "Update all" starts every pending update
+  at once and nothing blocks the rest of the panel any more.
+- Addons whose authors block third-party downloads no longer stop at a manual
+  step: the job opens the CurseForge download page (`/download/<fileId>`, which
+  starts the download by itself), waits up to 15 min in the background for the
+  ZIP in `~/Downloads` and installs it once size and SHA-1 match. A matching
+  ZIP that is already there is used without opening the browser. Waiting jobs
+  can be cancelled, re-opened, or imported by hand after a timeout.
+- Helper: `install`/`update`/`update-all` accept `--browser` and `--wait=S`
+  (`update-all` also `--jobs=N`) and report progress as JSON lines on stderr.
+  State and AddOns changes are serialized with a file lock so parallel
+  helper processes cannot lose each other's writes; JSON files are written
+  through unique temp files.
+
+## 1.2.1
+
+- WoW Forever left beta: auto-detect and the Flavor placeholder now prefer the
+  live `_forever_` folder over the retired `_classic_beta_` beta folder.
+- On a fresh client without `Interface/`, create `Interface/AddOns` below the
+  flavor folder instead of failing.
+- Header: show the flavor ("forever") in the hero pill instead of the full
+  AddOns path, which never elided and covered the title and buttons.
+- Manual import: the hint names the addon and version instead of the raw
+  CurseForge file name, and import also accepts a zip in ~/Downloads whose
+  name contains the addon name and version (some uploads carry odd names
+  like "CUsersJaliborcDesktopBagnon-12.1.7.zip").
+
 ## 1.2.0
 
 - Add a labelled "Update all (N)" button to the Installed tab, shown while

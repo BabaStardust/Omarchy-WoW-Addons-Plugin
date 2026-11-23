@@ -10,12 +10,18 @@ the shell reloads a plugin on any write below ~/.config/omarchy/plugins/, and
 `omarchy plugin update` must not touch user data.
 """
 
+import concurrent.futures
+import contextlib
+import fcntl
 import glob
 import hashlib
 import json
 import os
+import re
 import shutil
+import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -98,11 +104,34 @@ def read_json(path, fallback):
 
 def write_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp, path)
+    # A unique temp file: several helper processes may write at the same time.
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def file_lock(name):
+    """Exclusive lock shared by all helper processes (and threads: each call
+    opens its own file description, and flock locks conflict across those)."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE.parent / name, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def state_lock():
+    """Held around every read-modify-write of the state file and the AddOns
+    folder, so parallel installs and updates cannot lose each other's work."""
+    return file_lock("state.lock")
 
 
 def load_config():
@@ -142,8 +171,8 @@ def resolve(cfg):
     flavor = cfg.get("flavor")
     if not flavor:
         found = flavors_in(root)
-        # Forever betas ship as _classic_beta_ or _forever_*; prefer those, then any classic flavor.
-        flavor = next((f for f in found if "forever" in f or "classic_beta" in f), "")
+        # The live Forever client ships as _forever_ (the old beta was _classic_beta_).
+        flavor = next((f for f in found if f == "_forever_" or "forever" in f), "")
     if not flavor:
         return {"addonsDir": "", "source": "no-flavor", "wowRoot": root, "flavor": ""}
     return {"addonsDir": str(Path(root) / flavor / "Interface" / "AddOns"), "source": "detected", "wowRoot": root, "flavor": flavor}
@@ -154,12 +183,14 @@ def addons_dir(cfg):
     if not info["addonsDir"]:
         raise Failure("No AddOns folder found. Set the WoW folder and flavor in Settings.", code="no_addons_dir")
     path = Path(info["addonsDir"])
-    # The AddOns folder itself may be missing on a fresh client; its parent must exist.
+    # On a fresh client Interface/AddOns may not exist yet; create them as
+    # long as the flavor folder itself exists.
     if not path.is_dir():
-        if path.parent.is_dir():
-            path.mkdir()
-        else:
-            raise Failure("AddOns folder does not exist: " + str(path), code="no_addons_dir")
+        if not path.parent.is_dir():
+            if not path.parent.parent.is_dir():
+                raise Failure("AddOns folder does not exist: " + str(path), code="no_addons_dir")
+            path.parent.mkdir()
+        path.mkdir()
     return path
 
 
@@ -366,55 +397,220 @@ def record(state, target, mod, file_info, folders):
     }
 
 
-def do_install(cfg, mod_id, file_id=None, zip_path=None):
-    target = addons_dir(cfg)
-    mods = get_mods([mod_id])
-    if not mods:
-        raise Failure("Addon %d not found" % mod_id, code="not_found")
-    mod = mods[0]
+def resolve_file(cfg, mod_id, file_id=None, mod=None):
+    """(mod, file_info) for a mod's given or newest file."""
+    if mod is None:
+        mods = get_mods([mod_id])
+        if not mods:
+            raise Failure("Addon %d not found" % mod_id, code="not_found")
+        mod = mods[0]
     if file_id is None:
         idx = latest_file_index(mod, cfg)
         if not idx:
             raise Failure("%s has no file for this game version" % mod["name"], code="no_file")
         file_id = idx["fileId"]
-    file_info = get_file(mod_id, file_id)
-    state = load_state()
-    previous = installed_for(state, target).get(str(mod_id), {}).get("folders", [])
+    return mod, get_file(mod_id, file_id)
+
+
+def web_urls(mod, file_id):
+    base = (mod.get("links") or {}).get("websiteUrl") or WEBSITE + mod.get("slug", "")
+    # /download/<id> starts the download by itself; /files/<id> is the file page.
+    return base + "/download/%d" % file_id, base + "/files/%d" % file_id
+
+
+def manual_failure(mod, file_info):
+    download_url, files_url = web_urls(mod, file_info["id"])
+    return Failure(
+        "%s does not allow downloads through third-party apps. Download it on CurseForge and import it." % mod["name"],
+        code="distribution_disabled",
+        url=files_url,
+        downloadUrl=download_url,
+        modId=mod["id"],
+        fileId=file_info["id"],
+        fileName=file_info.get("fileName", ""),
+        modName=mod["name"],
+        version=file_info.get("displayName", ""),
+    )
+
+
+def do_install(cfg, mod_id, file_id=None, zip_path=None, browser=False, wait=None, mod=None):
+    """Install or update one addon.
+
+    Without a download URL (the author opted out of third-party downloads)
+    this fails with distribution_disabled, unless `browser` is set: then a
+    matching zip already in ~/Downloads is used, or the CurseForge download
+    page is opened and the zip is picked up as soon as the browser finishes.
+    """
+    target = addons_dir(cfg)
+    mod, file_info = resolve_file(cfg, mod_id, file_id, mod)
+    file_id = file_info["id"]
 
     with tempfile.TemporaryDirectory(prefix="wowaddons-") as tmp:
         if zip_path is None:
             url = file_info.get("downloadUrl")
-            if not url:
-                # The author opted out of third-party downloads; respect that and
-                # let the user fetch the file from the website, then `import` it.
-                raise Failure(
-                    "%s does not allow downloads through third-party apps. Download it on CurseForge and import it." % mod["name"],
-                    code="distribution_disabled",
-                    url=mod_summary(mod, cfg, {})["url"] + "/files/%d" % file_id,
-                    fileName=file_info.get("fileName", ""),
-                )
-            zip_path = Path(tmp) / "addon.zip"
-            download(url, zip_path)
+            if url:
+                progress("downloading", mod_id)
+                zip_path = Path(tmp) / "addon.zip"
+                download(url, zip_path)
+            elif browser:
+                zip_path = await_browser_download(mod, file_info, DEFAULT_WAIT if wait is None else wait)
+            else:
+                raise manual_failure(mod, file_info)
         verify_hash(zip_path, file_info)
-        folders = install_zip(zip_path, target, previous)
-
-    record(state, target, mod, file_info, folders)
-    write_json(STATE_FILE, state)
+        progress("installing", mod_id)
+        with state_lock():
+            state = load_state()
+            previous = installed_for(state, target).get(str(mod_id), {}).get("folders", [])
+            folders = install_zip(zip_path, target, previous)
+            record(state, target, mod, file_info, folders)
+            write_json(STATE_FILE, state)
     return {"ok": True, "modId": mod_id, "name": mod["name"], "fileId": file_id, "version": file_info.get("displayName", ""), "folders": folders, "addonsDir": str(target)}
 
 
-def find_download(file_name):
-    """A manually downloaded zip with the expected name, newest first."""
-    dirs = [Path(os.environ.get("XDG_DOWNLOAD_DIR") or Path.home() / "Downloads"), Path.home() / "Downloads"]
+# ── browser downloads ──────────────────────────────────────────────────
+
+DEFAULT_WAIT = 15 * 60
+POLL_SECONDS = 1.5
+
+
+def progress(event, mod_id, **extra):
+    """One JSON line on stderr per step, for the panel's job list. stdout
+    stays reserved for the single result document."""
+    try:
+        sys.stderr.write(json.dumps(dict({"event": event, "modId": mod_id}, **extra), ensure_ascii=False) + "\n")
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def open_in_browser(url):
+    # Parallel jobs open their pages one after another: several xdg-open calls
+    # at once can hit a browser that is still starting up.
+    with file_lock("browser.lock"):
+        try:
+            subprocess.Popen(["xdg-open", url], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            raise Failure("Could not open the browser: " + str(e), code="browser")
+        time.sleep(1.5)
+
+
+def matching_download(file_info, mod_name, checked):
+    """A zip in ~/Downloads that is this exact file, or None.
+
+    Browsers write under a temporary name or grow the final file while
+    downloading, so a candidate counts only once its hash (or, without a
+    hash, its size) matches. `checked` remembers (path, size, mtime) of
+    candidates that did not match, so they are hashed again only after
+    they changed.
+    """
+    expected = next((h["value"].lower() for h in file_info.get("hashes") or [] if h.get("algo") == 1), None)
+    length = file_info.get("fileLength")
+    candidates = download_candidates(file_info.get("fileName", ""), mod_name, file_info.get("displayName", ""))
+    if length:
+        # Any other zip of exactly this size, in case the browser or the user
+        # saved it under a different name; the hash still decides.
+        for d in download_dirs():
+            for p in d.glob("*.zip"):
+                try:
+                    if p not in candidates and p.stat().st_size == length:
+                        candidates.append(p)
+                except OSError:
+                    pass
+    for p in candidates:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        sig = (str(p), st.st_size, st.st_mtime_ns)
+        if sig in checked or st.st_size == 0:
+            continue
+        if length and st.st_size != length:
+            checked.add(sig)
+            continue
+        if expected and sha1_of(p).lower() != expected:
+            checked.add(sig)
+            continue
+        return p
+    return None
+
+
+def await_browser_download(mod, file_info, wait):
+    checked = set()
+    found = matching_download(file_info, mod["name"], checked)
+    if found:
+        return found
+    download_url, files_url = web_urls(mod, file_info["id"])
+    if wait <= 0:
+        raise manual_failure(mod, file_info)
+    open_in_browser(download_url)
+    progress("waiting", mod["id"], url=files_url, downloadUrl=download_url, fileName=file_info.get("fileName", ""), timeout=wait)
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        time.sleep(POLL_SECONDS)
+        found = matching_download(file_info, mod["name"], checked)
+        if found:
+            return found
+    e = manual_failure(mod, file_info)
+    e.extra["code"] = "download_timeout"
+    raise Failure("%s: no finished download in ~/Downloads after %d min. Download it on CurseForge and import it." % (mod["name"], wait // 60), **e.extra)
+
+
+def _alnum(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def download_dirs():
+    dirs = [os.environ.get("XDG_DOWNLOAD_DIR")]
+    try:
+        # xdg-user-dirs: XDG_DOWNLOAD_DIR="$HOME/Downloads"
+        for line in (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "user-dirs.dirs").read_text().splitlines():
+            m = re.match(r'\s*XDG_DOWNLOAD_DIR="(.*)"', line)
+            if m:
+                dirs.append(m.group(1).replace("$HOME", str(Path.home())))
+    except OSError:
+        pass
+    dirs.append(str(Path.home() / "Downloads"))
+    return [d for d in dict.fromkeys(Path(x) for x in dirs if x) if d.is_dir()]
+
+
+def find_download(file_name, mod_name="", version=""):
+    hits = download_candidates(file_name, mod_name, version)
+    return hits[0] if hits else None
+
+
+def download_candidates(file_name, mod_name="", version=""):
+    """Manually downloaded zips for this file, newest first.
+
+    Prefers the exact CurseForge file name (or a browser duplicate like
+    "name (1).zip"). Some uploads carry odd names (e.g. a mangled Windows
+    path such as "CUsersJaliborcDesktopBagnon-12.1.7.zip"), and browsers or
+    users may rename files, so fall back to any zip whose name contains both
+    the addon name and the version.
+    """
+    dirs = download_dirs()
     hits = []
-    for d in dict.fromkeys(dirs):
-        p = d / file_name
-        if p.is_file():
-            hits.append(p)
-        # Browsers rename duplicates to "name (1).zip".
-        stem, suffix = os.path.splitext(file_name)
-        hits.extend(d.glob(glob_escape(stem) + " (*)" + glob_escape(suffix)) if d.is_dir() else [])
-    return max(hits, key=lambda p: p.stat().st_mtime) if hits else None
+    stem, suffix = os.path.splitext(file_name)
+    for d in dirs:
+        if file_name:
+            p = d / file_name
+            if p.is_file():
+                hits.append(p)
+            # Browsers rename duplicates to "name (1).zip".
+            hits.extend(d.glob(glob_escape(stem) + " (*)" + glob_escape(suffix)))
+    if not hits and mod_name and version:
+        name_key, ver_key = _alnum(mod_name), _alnum(version)
+        for d in dirs:
+            for p in d.glob("*.zip"):
+                key = _alnum(p.stem)
+                if p.is_file() and name_key in key and ver_key in key:
+                    hits.append(p)
+
+    def mtime(p):
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0
+    return sorted(set(hits), key=mtime, reverse=True)
 
 
 def glob_escape(s):
@@ -520,8 +716,21 @@ def cmd_files(cfg, args):
     ]}
 
 
+def parse_opts(args):
+    """Positional args plus --browser / --wait=SECONDS."""
+    pos = [a for a in args if not a.startswith("--")]
+    browser = "--browser" in args
+    wait = None
+    for a in args:
+        if a.startswith("--wait="):
+            wait = int(a.split("=", 1)[1])
+    return pos, browser, wait
+
+
 def cmd_install(cfg, args):
-    return do_install(cfg, int(args[0]), int(args[1]) if len(args) > 1 else None)
+    """install <modId> [fileId] [--browser] [--wait=SECONDS]"""
+    pos, browser, wait = parse_opts(args)
+    return do_install(cfg, int(pos[0]), int(pos[1]) if len(pos) > 1 else None, browser=browser, wait=wait)
 
 
 def cmd_import(cfg, args):
@@ -531,9 +740,11 @@ def cmd_import(cfg, args):
         zip_path = Path(args[2]).expanduser()
     else:
         info = get_file(mod_id, file_id)
-        zip_path = find_download(info.get("fileName", ""))
+        mods = get_mods([mod_id])
+        mod_name = mods[0].get("name", "") if mods else ""
+        zip_path = find_download(info.get("fileName", ""), mod_name, info.get("displayName", ""))
         if not zip_path:
-            raise Failure("%s not found in ~/Downloads" % info.get("fileName", "Datei"), code="zip_missing", fileName=info.get("fileName", ""))
+            raise Failure("%s not found in ~/Downloads" % (info.get("fileName") or "Download"), code="zip_missing", fileName=info.get("fileName", ""))
     if not zip_path.is_file():
         raise Failure("File not found: " + str(zip_path), code="zip_missing")
     return do_install(cfg, mod_id, file_id, zip_path=zip_path)
@@ -579,25 +790,58 @@ def cmd_updates(cfg, args):
 
 
 def cmd_update(cfg, args):
-    return do_install(cfg, int(args[0]))
+    """update <modId> [--browser] [--wait=SECONDS]"""
+    pos, browser, wait = parse_opts(args)
+    return do_install(cfg, int(pos[0]), browser=browser, wait=wait)
+
+
+MAX_PARALLEL = 4
 
 
 def cmd_update_all(cfg, args):
+    """update-all [--browser] [--wait=SECONDS] [--jobs=N]
+
+    Updates run in parallel. Addons whose authors block third-party
+    downloads are skipped, or with --browser opened on CurseForge and
+    installed once the browser has downloaded them.
+    """
+    _, browser, wait = parse_opts(args)
+    jobs = MAX_PARALLEL
+    for a in args:
+        if a.startswith("--jobs="):
+            jobs = max(1, int(a.split("=", 1)[1]))
     done, skipped, failed = [], [], []
+    todo = []
     for u in check_updates(cfg):
-        if not u["distributable"]:
+        if u["distributable"] or browser:
+            todo.append(u)
+        else:
             skipped.append({"modId": u["modId"], "name": u["name"], "url": u["url"]})
-            continue
-        try:
-            done.append(do_install(cfg, u["modId"], u["latestFileId"]))
-        except Failure as e:
-            failed.append({"modId": u["modId"], "name": u["name"], "error": str(e)})
+    # Browser downloads mostly wait, so they get their own threads instead of
+    # blocking the download slots.
+    manual = [u for u in todo if not u["distributable"]]
+    direct = [u for u in todo if u["distributable"]]
+    pool = concurrent.futures.ThreadPoolExecutor
+    with pool(max_workers=jobs) as direct_pool, pool(max_workers=max(1, len(manual))) as manual_pool:
+        futures = {direct_pool.submit(do_install, cfg, u["modId"], u["latestFileId"]): u for u in direct}
+        futures.update({manual_pool.submit(do_install, cfg, u["modId"], u["latestFileId"], browser=True, wait=wait): u for u in manual})
+        for fut in concurrent.futures.as_completed(futures):
+            u = futures[fut]
+            try:
+                done.append(fut.result())
+            except Failure as e:
+                failed.append({"modId": u["modId"], "name": u["name"], "error": str(e), "code": e.extra.get("code", "")})
     return {"ok": not failed, "updated": done, "skipped": skipped, "failed": failed}
 
 
 def cmd_remove(cfg, args):
     mod_id = str(int(args[0]))
     target = addons_dir(cfg)
+    with state_lock():
+        return remove_locked(target, mod_id)
+
+
+def remove_locked(target, mod_id):
     state = load_state()
     entry = installed_for(state, target).pop(mod_id, None)
     if entry is None:
@@ -728,7 +972,7 @@ COMMANDS = {
     "version-types": (cmd_version_types, 0),
 }
 
-USAGE = "usage: wowaddons {search [query|projectId] | browse | files <modId> | install <modId> [fileId] | import <modId> <fileId> [zip] | list | updates | update <modId> | update-all | remove <modId> | config [set <key> <value> | reset] | key [status|set|check|clear] | version-types}"
+USAGE = "usage: wowaddons {search [query|projectId] | browse | files <modId> | install <modId> [fileId] [--browser] [--wait=S] | import <modId> <fileId> [zip] | list | updates | update <modId> [--browser] [--wait=S] | update-all [--browser] [--wait=S] [--jobs=N] | remove <modId> | config [set <key> <value> | reset] | key [status|set|check|clear] | version-types}"
 
 
 def main(argv):
@@ -747,4 +991,7 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    # Cancelling a job sends SIGTERM; exit through the normal path so temp
+    # folders and locks are released.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     main(sys.argv[1:])

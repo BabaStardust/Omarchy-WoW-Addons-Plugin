@@ -29,8 +29,16 @@ Panel {
   property var config: ({ config: {}, resolved: { addonsDir: "", source: "none" }, detectedRoots: [], flavors: [] })
   property string message: ""
   property bool messageIsError: false
-  // Set when an install needs a manual download: { modId, fileId, url, fileName }.
-  property var pendingImport: null
+  // Installs/updates run as parallel background jobs, keyed by modId:
+  // { key, modId, name, args, status, seq, url, downloadUrl, fileId, error, code, finishedAt }
+  // status: queued → downloading | waiting (browser) → installing → done | failed
+  property var jobs: ({})
+  property var jobProcs: ({})
+  property int jobSeq: 0
+  readonly property int maxParallel: 4
+  readonly property var jobList: Object.keys(jobs).map(function(k) { return jobs[k] }).sort(function(a, b) { return a.seq - b.seq })
+  readonly property int jobsRunning: jobList.filter(function(j) { return j.status !== "done" && j.status !== "failed" }).length
+  readonly property int jobsWaiting: jobList.filter(function(j) { return j.status === "waiting" }).length
   // API key setup: the guide is open by default until a key exists.
   property bool keyHelpOpen: !hasKey
   property string keyMessage: ""
@@ -95,20 +103,86 @@ Panel {
     setMessage(label + "…", false)
   }
 
+  // --browser: addons that block third-party downloads open their CurseForge
+  // download page and are installed as soon as the zip lands in ~/Downloads.
   function install(mod) {
-    pendingImport = null
-    run(["install", String(mod.id)], "Installing " + mod.name)
+    startJob(mod.id, mod.name, ["install", String(mod.id), "--browser"])
   }
 
   function update(modId, name) {
-    pendingImport = null
-    run(["update", String(modId)], "Updating " + name)
+    startJob(modId, name, ["update", String(modId), "--browser"])
   }
 
   function updateAll() {
-    if (busy || updateCount === 0) return
-    pendingImport = null
-    run(["update-all"], "Updating all addons")
+    for (var i = 0; i < updates.length; i++) update(updates[i].modId, updates[i].name)
+  }
+
+  function importDownload(job) {
+    startJob(job.modId, job.name, ["import", String(job.modId), String(job.fileId)])
+  }
+
+  function jobFor(modId) {
+    return jobs[String(modId)] || null
+  }
+
+  function jobActive(modId) {
+    var j = jobFor(modId)
+    return j !== null && j.status !== "done" && j.status !== "failed"
+  }
+
+  function setJob(key, patch) {
+    var all = Object.assign({}, jobs)
+    if (patch === null) delete all[key]
+    else all[key] = Object.assign({}, all[key] || {}, patch)
+    jobs = all
+  }
+
+  function startJob(modId, name, args) {
+    var key = String(modId)
+    if (jobActive(modId) || !hasAddonsDir) return
+    jobSeq += 1
+    setJob(key, { key: key, modId: Number(modId), name: name, args: args, status: "queued", seq: jobSeq, error: "", code: "", url: "", downloadUrl: "", fileId: 0, finishedAt: 0 })
+    pumpJobs()
+  }
+
+  // Jobs waiting for the browser do not take a slot.
+  function pumpJobs() {
+    var list = jobList
+    var active = list.filter(function(j) { return j.status === "starting" || j.status === "downloading" || j.status === "installing" }).length
+    for (var i = 0; i < list.length && active < maxParallel; i++) {
+      var j = list[i]
+      if (j.status !== "queued") continue
+      var proc = jobComponent.createObject(root, { jobKey: j.key, command: [helper].concat(j.args) })
+      var procs = Object.assign({}, jobProcs)
+      procs[j.key] = proc
+      jobProcs = procs
+      setJob(j.key, { status: "starting" })
+      proc.running = true
+      active += 1
+    }
+  }
+
+  function cancelJob(key) {
+    var proc = jobProcs[key]
+    if (proc) proc.running = false
+    else setJob(key, null)
+  }
+
+  function dismissJob(key) {
+    if (!jobActive(Number(key))) setJob(key, null)
+  }
+
+  function jobStatusText(j) {
+    switch (j.status) {
+    case "queued": return "Queued"
+    case "starting": return "Starting…"
+    case "downloading": return "Downloading…"
+    case "installing": return "Installing…"
+    case "waiting": return "Waiting for the browser download in ~/Downloads…"
+    case "done": return "Done" + (j.version ? ": " + j.version : "") + " ✓"
+    case "failed": return j.error || "Failed"
+    }
+    return j.status
   }
 
   function openUrl(url) {
@@ -175,6 +249,75 @@ Panel {
     running: root.updateCheckHours > 0
     repeat: true
     onTriggered: root.checkUpdates()
+  }
+
+  // Coalesces the refresh after several jobs finish close together.
+  Timer {
+    id: refreshTimer
+    interval: 400
+    onTriggered: {
+      if (listProc.running || updatesProc.running || configProc.running) { restart(); return }
+      root.refresh()
+      root.checkUpdates()
+      if (root.searchResult.mode !== "") root.search(searchField.text)
+    }
+  }
+
+  // Finished jobs stay visible for a moment; failed ones until dismissed.
+  Timer {
+    interval: 2000
+    repeat: true
+    running: root.jobList.some(function(j) { return j.status === "done" })
+    onTriggered: {
+      var now = Date.now()
+      root.jobList.forEach(function(j) { if (j.status === "done" && now - j.finishedAt > 6000) root.setJob(j.key, null) })
+    }
+  }
+
+  Component {
+    id: jobComponent
+    Process {
+      id: jobProc
+      property string jobKey: ""
+      // Progress events, one JSON object per line on stderr.
+      stderr: SplitParser {
+        onRead: function(data) {
+          var ev = Model.parse(data, null)
+          if (!ev || !ev.event) return
+          var patch = { status: ev.event }
+          if (ev.url) patch.url = ev.url
+          if (ev.downloadUrl) patch.downloadUrl = ev.downloadUrl
+          root.setJob(jobProc.jobKey, patch)
+          if (ev.event === "waiting") root.pumpJobs()
+        }
+      }
+      stdout: StdioCollector { id: jobOut; waitForEnd: true }
+      onExited: function(exitCode) {
+        var data = Model.parse(jobOut.text, null)
+        var key = jobProc.jobKey
+        if (data && data.ok) {
+          root.setJob(key, { status: "done", version: data.version || "", finishedAt: Date.now() })
+        } else if (!data) {
+          // Cancelled (or crashed) without a result.
+          root.setJob(key, null)
+        } else {
+          root.setJob(key, {
+            status: "failed",
+            error: data.error || "Failed",
+            code: data.code || "",
+            url: data.url || root.jobFor(key).url || "",
+            downloadUrl: data.downloadUrl || root.jobFor(key).downloadUrl || "",
+            fileId: Number(data.fileId || 0)
+          })
+        }
+        var procs = Object.assign({}, root.jobProcs)
+        delete procs[key]
+        root.jobProcs = procs
+        root.pumpJobs()
+        refreshTimer.restart()
+        jobProc.destroy()
+      }
+    }
   }
 
   Timer {
@@ -269,9 +412,7 @@ Panel {
         var detail = data.version ? ": " + data.version : ""
         if (data.updated) detail = ": " + data.updated.length + " updated" + (data.skipped.length ? ", " + data.skipped.length + " manual only" : "")
         root.setMessage(label + detail + " ✓", false)
-        if (data.fileId && root.pendingImport && root.pendingImport.fileId === data.fileId) root.pendingImport = null
       } else {
-        if (data.code === "distribution_disabled") root.pendingImport = { modId: Number(command[2]), fileId: Number(String(data.url).split("/").pop()), url: data.url, fileName: data.fileName }
         root.setMessage(data.error || (label + " failed"), true)
       }
       root.refresh()
@@ -285,10 +426,11 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: "󰊴"
-    active: root.updateCount > 0
+    active: root.updateCount > 0 || root.jobsRunning > 0
     activeColor: Color.accent
     tooltipText: "WoW Addons"
       + (root.updateCount > 0 ? "\n" + root.updateCount + (root.updateCount === 1 ? " update available" : " updates available") : "")
+      + (root.jobsRunning > 0 ? "\n" + root.jobsRunning + " running" + (root.jobsWaiting > 0 ? " (" + root.jobsWaiting + " waiting for browser download)" : "") : "")
       + (root.config.hasKey === false ? "\nCurseForge API key missing – click to set up" : "")
       + (root.hasAddonsDir ? "" : "\nWoW folder not set up yet")
     onPressed: function(buttonCode) {
@@ -350,7 +492,11 @@ Panel {
               title: "WoW Addons"
               meta: root.installed.installed.length + " installed"
                 + (root.updateCount > 0 ? " · " + root.updateCount + " Updates" : "")
-              detail: root.hasAddonsDir ? Model.shortPath(root.config.resolved.addonsDir) : "WoW folder missing → Settings"
+                + (root.jobsRunning > 0 ? " · " + root.jobsRunning + " running" : "")
+                + (root.hasAddonsDir ? "" : " · WoW folder missing → Settings")
+              // The hero's detail pill never elides, so keep it short: the
+              // flavor ("forever"), not the full AddOns path.
+              detail: root.hasAddonsDir ? Model.flavorLabel(root.config.resolved.flavor, root.config.resolved.addonsDir) : ""
               foreground: root.foreground
               fontFamily: root.fontFamily
               iconComponent: Component {
@@ -380,10 +526,10 @@ Panel {
               }
               PanelActionButton {
                 iconText: "󰚰"
-                tooltipText: "Install all updates (u)"
+                tooltipText: "Install all updates in parallel (u)"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                enabled: !root.busy && root.updateCount > 0
+                enabled: root.updates.some(function(u) { return !root.jobActive(u.modId) })
                 opacity: enabled ? 1.0 : 0.4
                 onClicked: root.updateAll()
               }
@@ -434,41 +580,22 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
-          // Author opted out of third-party downloads: browser + import.
-          RowLayout {
-            visible: root.pendingImport !== null
+          // ── Running installs/updates ───────────────────────────────
+          Column {
+            visible: root.jobList.length > 0
             width: parent.width
-            spacing: Style.space(6)
-            Text {
-              Layout.fillWidth: true
-              textFormat: Text.PlainText
-              text: root.pendingImport ? "1. Download  2. Import " + root.pendingImport.fileName + " from ~/Downloads" : ""
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-            PanelActionButton {
-              iconText: "󰖟"
-              tooltipText: "Open file on CurseForge"
+            spacing: Style.space(4)
+
+            PanelSectionHeader {
+              text: root.jobsWaiting > 0 ? "JOBS · DOWNLOAD IN THE BROWSER, THE REST HAPPENS HERE" : "JOBS"
               foreground: root.foreground
               fontFamily: root.fontFamily
-              onClicked: root.openUrl(root.pendingImport.url)
             }
-            PanelActionButton {
-              iconText: "󰋺"
-              tooltipText: "Import from ~/Downloads"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              enabled: !root.busy
-              onClicked: root.run(["import", String(root.pendingImport.modId), String(root.pendingImport.fileId)], "Import")
-            }
-            PanelActionButton {
-              iconText: "󰅖"
-              tooltipText: "Dismiss"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: root.pendingImport = null
+            ScrollList {
+              visibleRows: 4
+              rowHeight: root.resultRowHeight
+              model: root.jobList
+              delegate: JobRow {}
             }
           }
 
@@ -543,12 +670,12 @@ Panel {
               Button {
                 iconText: "󰚰"
                 text: "Update all (" + root.updateCount + ")"
-                tooltipText: "Install all updates (u)"
+                tooltipText: "Install all updates in parallel (u)"
                 bordered: true
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
-                enabled: !root.busy
+                enabled: root.updates.some(function(u) { return !root.jobActive(u.modId) })
                 opacity: enabled ? 1.0 : 0.4
                 onClicked: root.updateAll()
               }
@@ -689,7 +816,7 @@ Panel {
             SettingField {
               id: flavorField
               label: "Flavor"
-              placeholder: root.config.flavors.length ? root.config.flavors.join(", ") : "e.g. _classic_beta_"
+              placeholder: root.config.flavors.length ? root.config.flavors.join(", ") : "e.g. _forever_"
               configKey: "flavor"
             }
             SettingField {
@@ -978,10 +1105,11 @@ Panel {
       }
       PanelActionButton {
         iconText: resultRow.upd ? "󰚰" : (resultRow.modelData.installed ? "󰄬" : "󰇚")
-        tooltipText: resultRow.upd ? "Update" : (resultRow.modelData.installed ? "Installed – reinstall" : "Install")
+        tooltipText: (resultRow.upd ? "Update" : (resultRow.modelData.installed ? "Installed – reinstall" : "Install"))
+          + (resultRow.modelData.distributable ? "" : " (opens the download in the browser)")
         foreground: resultRow.upd ? Color.accent : root.foreground
         fontFamily: root.fontFamily
-        enabled: !root.busy && root.hasAddonsDir && resultRow.modelData.latestFileId !== null
+        enabled: !root.jobActive(resultRow.modelData.id) && root.hasAddonsDir && resultRow.modelData.latestFileId !== null
         opacity: enabled ? 1.0 : 0.4
         onClicked: root.install(resultRow.modelData)
       }
@@ -1044,10 +1172,10 @@ Panel {
       PanelActionButton {
         visible: !!installedRow.upd
         iconText: "󰚰"
-        tooltipText: installedRow.upd && !installedRow.upd.distributable ? "Update possible manually only" : "Update"
+        tooltipText: installedRow.upd && !installedRow.upd.distributable ? "Update (opens the download in the browser)" : "Update"
         foreground: Color.accent
         fontFamily: root.fontFamily
-        enabled: !root.busy
+        enabled: !root.jobActive(installedRow.modelData.modId)
         onClicked: root.update(installedRow.modelData.modId, installedRow.modelData.name)
       }
       PanelActionButton {
@@ -1063,8 +1191,99 @@ Panel {
         foreground: root.foreground
         hoverColor: root.urgent
         fontFamily: root.fontFamily
-        enabled: !root.busy
+        enabled: !root.busy && !root.jobActive(installedRow.modelData.modId)
         onClicked: root.run(["remove", String(installedRow.modelData.modId)], "Removing " + installedRow.modelData.name)
+      }
+    }
+  }
+
+  component JobRow: CursorSurface {
+    id: jobRow
+    required property var modelData
+    readonly property bool failed: modelData.status === "failed"
+    readonly property bool manual: modelData.code === "distribution_disabled" || modelData.code === "download_timeout"
+
+    width: ListView.view.rowWidth
+    height: root.resultRowHeight
+    hasCursor: jobMouse.containsMouse
+    foreground: root.foreground
+
+    MouseArea {
+      id: jobMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.NoButton
+    }
+
+    ColumnLayout {
+      anchors.left: parent.left
+      anchors.right: jobActions.left
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(6)
+      spacing: Style.space(1)
+
+      Text {
+        Layout.fillWidth: true
+        textFormat: Text.PlainText
+        text: jobRow.modelData.name
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        elide: Text.ElideRight
+      }
+      Text {
+        Layout.fillWidth: true
+        textFormat: Text.PlainText
+        text: root.jobStatusText(jobRow.modelData)
+        color: jobRow.failed ? root.urgent : (jobRow.modelData.status === "waiting" || jobRow.modelData.status === "done" ? Color.accent : root.dim)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+        // Long errors: full text on hover.
+        ToolTip.visible: jobRow.failed && jobMouse.containsMouse
+        ToolTip.text: jobRow.modelData.error || ""
+      }
+    }
+
+    Row {
+      id: jobActions
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+
+      PanelActionButton {
+        visible: jobRow.modelData.status === "waiting" || jobRow.manual
+        iconText: "󰖟"
+        tooltipText: "Open the download on CurseForge again"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: root.openUrl(jobRow.modelData.downloadUrl || jobRow.modelData.url)
+      }
+      PanelActionButton {
+        visible: jobRow.failed && jobRow.manual && jobRow.modelData.fileId > 0
+        iconText: "󰋺"
+        tooltipText: "Import from ~/Downloads"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: root.importDownload(jobRow.modelData)
+      }
+      PanelActionButton {
+        visible: jobRow.failed && !jobRow.manual
+        iconText: "󰑐"
+        tooltipText: "Retry"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: root.startJob(jobRow.modelData.modId, jobRow.modelData.name, jobRow.modelData.args)
+      }
+      PanelActionButton {
+        visible: jobRow.modelData.status === "queued" || jobRow.modelData.status === "waiting" || jobRow.failed || jobRow.modelData.status === "done"
+        iconText: "󰅖"
+        tooltipText: jobRow.failed || jobRow.modelData.status === "done" ? "Dismiss" : "Cancel"
+        foreground: root.foreground
+        hoverColor: root.urgent
+        fontFamily: root.fontFamily
+        onClicked: jobRow.failed || jobRow.modelData.status === "done" ? root.dismissJob(jobRow.modelData.key) : root.cancelJob(jobRow.modelData.key)
       }
     }
   }

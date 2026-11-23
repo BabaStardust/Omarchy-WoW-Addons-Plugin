@@ -40,3 +40,13 @@ function shortPath(path) {
   var i = s.indexOf("/drive_c/")
   return i >= 0 ? "…" + s.slice(i) : s.replace(/^\/home\/[^/]+/, "~")
 }
+
+// Short label for the hero pill: "_forever_" → "forever".
+function flavorLabel(flavor, addonsDir) {
+  var f = String(flavor || "")
+  if (!f) {
+    var m = String(addonsDir || "").match(/\/(_[^/]+_)\/Interface\/AddOns\/?$/)
+    f = m ? m[1] : ""
+  }
+  return f.replace(/^_+|_+$/g, "").replace(/_/g, " ")
+}

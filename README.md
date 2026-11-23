@@ -11,8 +11,12 @@ update and remove them without leaving your desktop. Defaults to
 - Search by name or project ID, one-click install
 - Installed tab with version info, per-addon update/remove, "update all"
 - Verifies CurseForge checksums and refuses unsafe ZIP paths
+- Installs and updates run in parallel in the background; "Update all"
+  starts every pending update at once
 - Respects authors who disable third-party downloads: the panel opens the
-  CurseForge page and imports the ZIP from `~/Downloads` for you
+  CurseForge download in your browser, waits in the background for the ZIP
+  in `~/Downloads` and installs it as soon as it is complete (checksum
+  verified), while the other updates carry on
 - Auto-detects WoW installs under Wine/Proton/Lutris/Steam prefixes
 
 ## Install
